@@ -1565,7 +1565,7 @@ def create(vm_=None, call=None):
 
     # Update the return dict with the instance data and
     # volume data if it exists
-    ret.update(instance_data)
+    ret = instance_data
     if volumes:
         ret['Attached Volumes'] = volumes
 
@@ -1588,8 +1588,8 @@ def create(vm_=None, call=None):
         },
     )
 
-    # saltify
-    deploy(vm_, call='action')
+    # Execute deploy action method to saltify the vm
+    # deploy(vm_, call='action')
 
     return ret
 
