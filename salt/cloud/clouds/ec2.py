@@ -87,7 +87,7 @@ from salt._compat import ElementTree as ET
 # Import salt.cloud libs
 import salt.utils.cloud
 import salt.config as config
-from salt.cloud.libcloudfuncs import *   # pylint: disable=W0614,W0401
+from salt.cloud.libcloudfuncs import *   # pyflakes: disable=W0614,W0401 # NOQA
 from salt.cloud.exceptions import (
     SaltCloudException,
     SaltCloudSystemExit,
@@ -320,6 +320,440 @@ def query(params=None, setname=None, requesturl=None, location=None,
     return ret
 
 
+def launch_instance(vm_):
+    location = get_location(vm_)
+    spot_config = get_spot_config(vm_)
+    launch_params = __get_launch_params(vm_)
+    tags_ = tags(vm_)
+
+    log.info('Creating Cloud VM {0} in {1}'.format(vm_['name'], location))
+    salt.utils.cloud.fire_event(
+        'event',
+        'requesting instance',
+        'salt/cloud/{0}/requesting'.format(vm_['name']),
+        {'kwargs': launch_params, 'location': location},
+    )
+
+    try:
+        launch_data = query(launch_params, 'instancesSet', location=location)
+        if 'error' in launch_data:
+            return launch_data['error']
+    except Exception as exc:
+        log.error(
+            'Error creating {0} on EC2 when trying to run the initial '
+            'deployment: \n{1}'.format(
+                vm_['name'], exc
+            ),
+            # Show the traceback if the debug logging level is enabled
+            exc_info=log.isEnabledFor(logging.DEBUG)
+        )
+        raise
+
+    # if we're using spot instances, we need to wait for the spot request
+    # to become active before we continue
+    if spot_config:
+        sir_id = launch_data[0]['spotInstanceRequestId']
+        launch_data = __describe_spot_instance(sir_id, location=location)
+
+    # Pull the instance ID, valid for both spot and normal instances
+    instance_id = launch_data[0]['instanceId']
+    log.debug('The new VM instance_id is {0}'.format(instance_id))
+
+    instance_data, requesturl = __describe_instance(vm_,
+                                                    instance_id,
+                                                    location=location)
+    log.debug('VM instance data {0}'.format(instance_data))
+    __wait_for_ip(vm_, instance_id, requesturl)
+
+    if tags_:
+        set_tags(vm_['name'],
+                 tags_,
+                 instance_id=instance_id,
+                 call='action',
+                 location=location)
+
+    log.info('Created node {0}'.format(vm_['name']))
+
+    # Wait for SSH
+    __wait_for_ssh(vm_, instance_data)
+
+    # create and attach volumes
+    volumes = __create_volumes(vm_, instance_data)
+
+    return instance_data, volumes
+
+
+def __wait_for_ip(vm_, instance_id, requesturl=None):
+    def __query_ip_address(params, url):
+        data = query(params, requesturl=url)
+        if not data:
+            log.error(
+                'There was an error while querying EC2. Empty response'
+            )
+            # Trigger a failure in the wait for IP function
+            return False
+
+        if isinstance(data, dict) and 'error' in data:
+            log.warn(
+                'There was an error in the query. {0}'.format(data['error'])
+            )
+            # Trigger a failure in the wait for IP function
+            return False
+
+        log.debug('Returned query data: {0}'.format(data))
+
+        if 'ipAddress' in data[0]['instancesSet']['item']:
+            return data
+        if get_ssh_interface(vm_) == 'private_ips' and \
+                'privateIpAddress' in data[0]['instancesSet']['item']:
+            return data
+
+    salt.utils.cloud.fire_event(
+        'event',
+        'waiting for instance IP',
+        'salt/cloud/{0}/wait_for_ip'.format(vm_['name']),
+        {'instance_id': instance_id},
+    )
+    params = {'Action': 'DescribeInstances',
+              'InstanceId.1': instance_id}
+    try:
+        data = salt.utils.cloud.wait_for_ip(
+            __query_ip_address,
+            update_args=(params, requesturl),
+            timeout=config.get_cloud_config_value(
+                'wait_for_ip_timeout', vm_, __opts__, default=10 * 60),
+            interval=config.get_cloud_config_value(
+                'wait_for_ip_interval', vm_, __opts__, default=10),
+            interval_multiplier=config.get_cloud_config_value(
+                'wait_for_ip_interval_multiplier', vm_, __opts__, default=1),
+        )
+        return data
+    except (SaltCloudExecutionTimeout, SaltCloudExecutionFailure) as exc:
+        try:
+            # It might be already up, let's destroy it!
+            destroy(vm_['name'])
+        except SaltCloudSystemExit:
+            pass
+        finally:
+            raise SaltCloudSystemExit(exc.message)
+
+
+def __wait_for_ssh(vm_, instance_data):
+    ssh_gateway_config = get_ssh_gateway_config(vm_)
+    usernames = get_ssh_username(vm_)
+    key_filename = get_key_filename(vm_)
+
+    if get_ssh_interface(vm_) == 'private_ips':
+        ip_address = instance_data['privateIpAddress']
+        log.info('Salt node data. Private_ip: {0}'.format(ip_address))
+    else:
+        ip_address = instance_data['ipAddress']
+        log.info('Salt node data. Public_ip: {0}'.format(ip_address))
+
+    display_ssh_output = config.get_cloud_config_value(
+        'display_ssh_output', vm_, __opts__, default=True
+    )
+
+    salt.utils.cloud.fire_event(
+        'event',
+        'waiting for ssh',
+        'salt/cloud/{0}/waiting_for_ssh'.format(vm_['name']),
+        {'ip_address': ip_address},
+    )
+
+    ssh_connect_timeout = config.get_cloud_config_value(
+        'ssh_connect_timeout', vm_, __opts__, 900   # 15 minutes
+    )
+
+    if config.get_cloud_config_value('win_installer', vm_, __opts__):
+        username = config.get_cloud_config_value(
+            'win_username', vm_, __opts__, default='Administrator'
+        )
+        win_passwd = config.get_cloud_config_value(
+            'win_password', vm_, __opts__, default=''
+        )
+        if not salt.utils.cloud.wait_for_port(ip_address,
+                                              port=445,
+                                              timeout=ssh_connect_timeout):
+            raise SaltCloudSystemExit(
+                'Failed to connect to remote windows host'
+            )
+        if not salt.utils.cloud.validate_windows_cred(ip_address,
+                                                      username,
+                                                      win_passwd):
+            raise SaltCloudSystemExit(
+                'Failed to authenticate against remote windows host'
+            )
+    elif salt.utils.cloud.wait_for_port(ip_address,
+                                        timeout=ssh_connect_timeout,
+                                        gateway=ssh_gateway_config):
+        for user in usernames:
+            if salt.utils.cloud.wait_for_passwd(
+                host=ip_address,
+                username=user,
+                ssh_timeout=config.get_cloud_config_value(
+                    'wait_for_passwd_timeout', vm_, __opts__, default=1 * 60),
+                key_filename=key_filename,
+                display_ssh_output=display_ssh_output,
+                gateway=ssh_gateway_config
+            ):
+                username = user
+                break
+        else:
+            raise SaltCloudSystemExit(
+                'Failed to authenticate against remote ssh'
+            )
+    else:
+        raise SaltCloudSystemExit(
+            'Failed to connect to remote ssh'
+        )
+
+    return ip_address, username, key_filename
+
+
+def __get_launch_params(vm_):
+    spot_config = get_spot_config(vm_)
+    if spot_config is not None:
+        if 'type' in spot_config:
+            spot_type = spot_config['type']
+        else:
+            spot_type = 'one-time'
+        params = {'Action': 'RequestSpotInstances',
+                  'InstanceCount': '1',
+                  'Type': spot_type,
+                  'SpotPrice': spot_config['spot_price']}
+
+        # All of the necessary launch parameters for a VM when using
+        # spot instances are the same except for the prefix below
+        # being tacked on.
+        spot_prefix = 'LaunchSpecification.'
+
+    # regular EC2 instance
+    else:
+        params = {'Action': 'RunInstances',
+                  'MinCount': '1',
+                  'MaxCount': '1'}
+
+        # Normal instances should have no prefix.
+        spot_prefix = ''
+
+    image_id = vm_['image']
+    params[spot_prefix + 'ImageId'] = image_id
+
+    vm_size = config.get_cloud_config_value(
+        'size', vm_, __opts__, search_global=False
+    )
+    if vm_size in SIZE_MAP:
+        vm_size = SIZE_MAP[vm_size]
+    params[spot_prefix + 'InstanceType'] = vm_size
+
+    ex_keyname = keyname(vm_)
+    if ex_keyname:
+        params[spot_prefix + 'KeyName'] = ex_keyname
+
+    ex_securitygroup = get_securitygroup(vm_)
+    if ex_securitygroup:
+        if not isinstance(ex_securitygroup, list):
+            params[spot_prefix + 'SecurityGroup.1'] = ex_securitygroup
+        else:
+            for counter, sg_ in enumerate(ex_securitygroup):
+                params[spot_prefix + 'SecurityGroup.{0}'.format(counter)] = sg_
+
+    ex_iam_profile = get_iam_profile(vm_)
+    if ex_iam_profile:
+        if ex_iam_profile.startswith('arn:aws:iam:'):
+            params[spot_prefix + 'IamInstanceProfile.Arn'] = ex_iam_profile
+        else:
+            params[spot_prefix + 'IamInstanceProfile.Name'] \
+                = ex_iam_profile
+
+    az_ = get_availability_zone(vm_)
+    if az_ is not None:
+        params[spot_prefix + 'Placement.AvailabilityZone'] = az_
+
+    tenancy_ = get_tenancy(vm_)
+    if tenancy_ is not None:
+        params['Placement.Tenancy'] = tenancy_
+
+    subnetid_ = get_subnetid(vm_)
+    if subnetid_ is not None:
+        params[spot_prefix + 'SubnetId'] = subnetid_
+
+    ex_securitygroupid = get_securitygroupid(vm_)
+    if ex_securitygroupid:
+        if not isinstance(ex_securitygroupid, list):
+            params[spot_prefix + 'SecurityGroupId.1'] = ex_securitygroupid
+        else:
+            for (counter, sg_) in enumerate(ex_securitygroupid):
+                params[spot_prefix + 'SecurityGroupId.{0}'.format(counter)] \
+                    = sg_
+
+    ex_blockdevicemappings = block_device_mappings(vm_)
+    if ex_blockdevicemappings:
+        params.update(_param_from_config(spot_prefix + 'BlockDeviceMapping',
+                                         ex_blockdevicemappings))
+
+    network_interfaces = config.get_cloud_config_value(
+        'network_interfaces', vm_, __opts__, search_global=False
+    )
+
+    if network_interfaces:
+        params.update(_param_from_config(spot_prefix + 'NetworkInterface',
+                                         network_interfaces))
+
+    set_ebs_optimized = get_ebs_optimized(vm_)
+    if set_ebs_optimized is not None:
+        params[spot_prefix + 'EbsOptimized'] = set_ebs_optimized
+
+    set_del_root_vol_on_destroy = get_del_root_vol_on_destroy(vm_)
+    if set_del_root_vol_on_destroy:
+        # first make sure to look up the root device name
+        # as Ubuntu and CentOS (and most likely other OSs)
+        # use different device identifiers
+
+        log.info('Attempting to look up root device name for image id {0} on '
+                 'VM {1}'.format(image_id, vm_['name']))
+
+        rd_params = {
+            'Action': 'DescribeImages',
+            'ImageId.1': image_id
+        }
+        try:
+            rd_data = query(rd_params, location=location)
+            if 'error' in rd_data:
+                return rd_data['error']
+            log.debug('EC2 Response: {0!r}'.format(rd_data))
+        except Exception as exc:
+            log.error(
+                'Error getting root device name for image id {0} for '
+                'VM {1}: \n{2}'.format(image_id, vm_['name'], exc),
+                # Show the traceback if the debug logging level is enabled
+                exc_info=log.isEnabledFor(logging.DEBUG)
+            )
+            raise
+
+        # make sure we have a response
+        if not rd_data:
+            err_msg = 'There was an error querying EC2 for the root device ' \
+                      'of image id {0}. Empty response.'.format(image_id)
+            raise SaltCloudSystemExit(err_msg)
+
+        # pull the root device name from the result and use it when
+        # launching the new VM
+        if rd_data[0]['blockDeviceMapping'] is None:
+            # Some ami instances do not have a root volume. Ignore such cases
+            rd_name = None
+        elif type(rd_data[0]['blockDeviceMapping']['item']) is list:
+            rd_name = rd_data[0]['blockDeviceMapping']['item'][0]['deviceName']
+        else:
+            rd_name = rd_data[0]['blockDeviceMapping']['item']['deviceName']
+        log.info('Found root device name: {0}'.format(rd_name))
+
+        if rd_name is not None:
+            if ex_blockdevicemappings:
+                dev_list = [dev['DeviceName'] for
+                            dev in ex_blockdevicemappings]
+            else:
+                dev_list = []
+
+            if rd_name in dev_list:
+                dev_index = dev_list.index(rd_name)
+                termination_key = spot_prefix + \
+                    'BlockDeviceMapping.%d.Ebs.DeleteOnTermination' % dev_index
+                params[termination_key] = str(
+                    set_del_root_vol_on_destroy).lower()
+            else:
+                dev_index = len(dev_list)
+                params[spot_prefix +
+                       'BlockDeviceMapping.%d.DeviceName' %
+                       dev_index] = rd_name
+                params[spot_prefix +
+                       'BlockDeviceMapping.%d.Ebs.DeleteOnTermination' %
+                       dev_index] = str(set_del_root_vol_on_destroy).lower()
+    return params
+
+
+def __describe_spot_instance(sir_id, location=None):
+    salt.utils.cloud.fire_event(
+        'event',
+        'waiting for spot instance',
+        'salt/cloud/{0}/waiting_for_spot'.format(vm_['name']),
+    )
+
+    def __query_spot_instance_request(sir_id, location):
+        params = {'Action': 'DescribeSpotInstanceRequests',
+                  'SpotInstanceRequestId.1': sir_id}
+        data = query(params, location=location)
+        if not data:
+            log.error(
+                'There was an error while querying EC2. Empty response'
+            )
+            # Trigger a failure in the wait for spot instance method
+            return False
+
+        if isinstance(data, dict) and 'error' in data:
+            log.warn(
+                'There was an error in the query. {0}'.format(data['error'])
+            )
+            # Trigger a failure in the wait for spot instance method
+            return False
+
+        log.debug('Returned query data: {0}'.format(data))
+
+        if 'state' in data[0]:
+            state = data[0]['state']
+
+        if state == 'active':
+            return data
+
+        if state == 'open':
+            # Still waiting for an active state
+            log.info('Spot instance status: {0}'.format(
+                data[0]['status']['message']
+            ))
+            return None
+
+        if state in ['cancelled', 'failed', 'closed']:
+            # Request will never be active, fail
+            log.error('Spot instance request resulted in state \'{0}\'. '
+                      'Nothing else we can do here.')
+            return False
+
+    try:
+        data = _wait_for_spot_instance(
+            __query_spot_instance_request,
+            update_args=(sir_id, location),
+            timeout=config.get_cloud_config_value(
+                'wait_for_spot_timeout', vm_, __opts__, default=10 * 60),
+            interval=config.get_cloud_config_value(
+                'wait_for_spot_interval', vm_, __opts__, default=30),
+            interval_multiplier=config.get_cloud_config_value(
+                'wait_for_spot_interval_multiplier',
+                vm_,
+                __opts__,
+                default=1),
+            max_failures=config.get_cloud_config_value(
+                'wait_for_spot_max_failures', vm_, __opts__, default=10),
+        )
+        log.debug('wait_for_spot_instance data {0}'.format(data))
+        return data
+
+    except (SaltCloudExecutionTimeout, SaltCloudExecutionFailure) as exc:
+        try:
+            # Cancel the existing spot instance request
+            cancel_spot_params = {'Action': 'CancelSpotInstanceRequests',
+                                  'SpotInstanceRequestId.1': sir_id}
+            data = query(cancel_spot_params, location=location)
+
+            log.debug('Canceled spot instance request {0}. Data '
+                      'returned: {1}'.format(sir_id, data))
+
+        except SaltCloudSystemExit:
+            pass
+        finally:
+            raise SaltCloudSystemExit(exc.message)
+
+
 def _wait_for_spot_instance(update_callback,
                             update_args=None,
                             update_kwargs=None,
@@ -332,9 +766,9 @@ def _wait_for_spot_instance(update_callback,
     for a specific maximum amount of time.
 
     :param update_callback: callback function which queries the cloud provider
-                            for spot instance request. It must return None if the
-                            required data, running instance included, is not
-                            available yet.
+                            for spot instance request. It must return None if
+                            the required data, running instance included, is
+                            not available yet.
     :param update_args: Arguments to pass to update_callback
     :param update_kwargs: Keyword arguments to pass to update_callback
     :param timeout: The maximum amount of time(in seconds) to wait for the IP
@@ -396,6 +830,81 @@ def _wait_for_spot_instance(update_callback,
                 interval = timeout + 1
             log.info('Interval multiplier in effect; interval is '
                      'now {0}s'.format(interval))
+
+
+def __describe_instance(vm_, instance_id, location=None):
+    salt.utils.cloud.fire_event(
+        'event',
+        'querying instance',
+        'salt/cloud/{0}/querying'.format(vm_['name']),
+        {'instance_id': instance_id},
+    )
+
+    describe_params = {'Action': 'DescribeInstances',
+                       'InstanceId.1': instance_id}
+
+    attempts = 5
+    while attempts > 0:
+        data, requesturl = query(describe_params,
+                                 location=location,
+                                 return_url=True)
+        log.debug('The query returned: {0}'.format(data))
+
+        if isinstance(data, dict) and 'error' in data:
+            log.warn(
+                'There was an error in the query. {0} attempts '
+                'remaining: {1}'.format(
+                    attempts, data['error']
+                )
+            )
+            attempts -= 1
+            continue
+
+        if isinstance(data, list) and not data:
+            log.warn(
+                'Query returned an empty list. {0} attempts '
+                'remaining.'.format(attempts)
+            )
+            attempts -= 1
+            continue
+
+        break
+    else:
+        raise SaltCloudSystemExit(
+            'An error occurred while creating VM: {0}'.format(data['error'])
+        )
+
+    return data[0]['instancesSet']['item'], requesturl
+
+
+def __create_volumes(vm_, instance_data):
+    # Get ANY defined volumes settings, merging data, in the following order
+    # 1. VM config
+    # 2. Profile config
+    # 3. Global configuration
+    volumes = get_volumes(vm_)
+
+    if volumes:
+        salt.utils.cloud.fire_event(
+            'event',
+            'attaching volumes',
+            'salt/cloud/{0}/attaching_volumes'.format(vm_['name']),
+            {'volumes': volumes},
+        )
+
+        log.info('Create and attach volumes to node {0}'.format(vm_['name']))
+        created = create_attach_volumes(
+            vm_['name'],
+            {
+                'volumes': volumes,
+                'zone': instance_data['placement']['availabilityZone'],
+                'instance_id': instance_data['instanceId'],
+                'del_all_vols_on_destroy': set_del_all_vols_on_destroy
+            },
+            call='action'
+        )
+        return created
+    return None
 
 
 def avail_sizes(call=None):
@@ -599,7 +1108,84 @@ def keyname(vm_):
     )
 
 
-def securitygroup(vm_):
+def tags(vm_):
+    tags = config.get_cloud_config_value('tag',
+                                         vm_,
+                                         __opts__,
+                                         {},
+                                         search_global=False)
+    if not isinstance(tags, dict):
+        raise SaltCloudConfigError('\'tag\' should be a dict.')
+
+    for value in tags.values():
+        if not isinstance(value, str):
+            raise SaltCloudConfigError(
+                '\'tag\' values must be strings. Try quoting the values. '
+                'e.g. "2013-09-19T20:09:46Z".'
+            )
+
+    # Set the Name tag for the VM
+    tags['Name'] = vm_['name']
+    return tags
+
+
+def get_key_filename(vm_):
+    key_filename = config.get_cloud_config_value(
+        'private_key', vm_, __opts__, search_global=False, default=None
+    )
+    if key_filename is not None and not os.path.isfile(key_filename):
+        raise SaltCloudConfigError(
+            'The defined key_filename {0!r} does not exist'.format(
+                key_filename
+            )
+        )
+    return key_filename
+
+
+def del_all_vols_on_destroy(vm_):
+    set_del_all_vols_on_destroy = config.get_cloud_config_value(
+        'del_all_vols_on_destroy', vm_, __opts__, search_global=False
+    )
+    if set_del_all_vols_on_destroy is not None:
+        if not isinstance(set_del_all_vols_on_destroy, bool):
+            raise SaltCloudConfigError(
+                '\'del_all_vols_on_destroy\' should be a boolean value.'
+            )
+    return set_del_all_vols_on_destroy
+
+
+def get_ebs_optimized(vm_):
+    set_ebs_optimized = config.get_cloud_config_value(
+        'ebs_optimized', vm_, __opts__, search_global=False
+    )
+    if set_ebs_optimized is not None:
+        if not isinstance(set_ebs_optimized, bool):
+            raise SaltCloudConfigError(
+                '\'ebs_optimized\' should be a boolean value.'
+            )
+    return set_ebs_optimized
+
+
+def get_del_root_vol_on_destroy(vm_):
+    set_del_root_vol_on_destroy = config.get_cloud_config_value(
+        'del_root_vol_on_destroy', vm_, __opts__, search_global=False
+    )
+
+    if set_del_root_vol_on_destroy is not None:
+        if not isinstance(set_del_root_vol_on_destroy, bool):
+            raise SaltCloudConfigError(
+                '\'del_root_vol_on_destroy\' should be a boolean value.'
+            )
+    return set_del_root_vol_on_destroy
+
+
+def get_volumes(vm_):
+    return config.get_cloud_config_value(
+        'volumes', vm_, __opts__, search_global=True
+    )
+
+
+def get_securitygroup(vm_):
     '''
     Return the security group
     '''
@@ -608,7 +1194,7 @@ def securitygroup(vm_):
     )
 
 
-def iam_profile(vm_):
+def get_iam_profile(vm_):
     '''
     Return the IAM profile.
 
@@ -627,12 +1213,17 @@ def iam_profile(vm_):
     Example: s3access
 
     '''
-    return config.get_cloud_config_value(
+    iam_profile = config.get_cloud_config_value(
         'iam_profile', vm_, __opts__, search_global=False
     )
+    if iam_profile is not None and not isinstance(iam_profile, basestring):
+        raise SaltCloudConfigError(
+            '\'iam_profile\' should be a string value.'
+        )
+    return iam_profile
 
 
-def ssh_username(vm_):
+def get_ssh_username(vm_):
     '''
     Return the ssh_username. Defaults to a built-in list of users for trying.
     '''
@@ -660,7 +1251,7 @@ def ssh_username(vm_):
     return usernames
 
 
-def ssh_interface(vm_):
+def get_ssh_interface(vm_):
     '''
     Return the ssh_interface type to connect to. Either 'public_ips' (default)
     or 'private_ips'.
@@ -721,7 +1312,8 @@ def get_ssh_gateway_config(vm_):
                 key_filename
             )
         )
-    elif key_filename is None and not ssh_gateway_config['ssh_gateway_password']:
+    elif key_filename is None \
+            and not ssh_gateway_config['ssh_gateway_password']:
         raise SaltCloudConfigError(
             'No authentication method. Please define: '
             ' ssh_gateway_password or ssh_gateway_private_key'
@@ -813,9 +1405,17 @@ def get_tenancy(vm_):
 
     Can be "dedicated" or "default". Cannot be present for spot instances.
     '''
-    return config.get_cloud_config_value(
+    tenancy = config.get_cloud_config_value(
         'tenancy', vm_, __opts__, search_global=False
     )
+    # tenancy and spot_config can't be used together
+    spot_config = get_spot_config(vm_)
+    if spot_config is not None:
+        raise SaltCloudConfigError(
+            'Spot instance config for {0} does not support '
+            'specifying tenancy.'.format(vm_['name'])
+        )
+    return tenancy
 
 
 def get_subnetid(vm_):
@@ -827,7 +1427,7 @@ def get_subnetid(vm_):
     )
 
 
-def securitygroupid(vm_):
+def get_securitygroupid(vm_):
     '''
     Returns the SecurityGroupId
     '''
@@ -840,9 +1440,16 @@ def get_spot_config(vm_):
     '''
     Returns the spot instance configuration for the provided vm
     '''
-    return config.get_cloud_config_value(
+    spot_config = config.get_cloud_config_value(
         'spot_config', vm_, __opts__, search_global=False
     )
+    if spot_config is not None:
+        if 'spot_price' not in spot_config:
+            raise SaltCloudConfigError(
+                '\'spot_config\' for {0} requires a \'spot_price\' '
+                'attribute.'.format(vm_['name'])
+            )
+    return spot_config
 
 
 def list_availability_zones():
@@ -945,639 +1552,29 @@ def create(vm_=None, call=None):
         },
     )
 
-    key_filename = config.get_cloud_config_value(
-        'private_key', vm_, __opts__, search_global=False, default=None
-    )
-    if key_filename is not None and not os.path.isfile(key_filename):
-        raise SaltCloudConfigError(
-            'The defined key_filename {0!r} does not exist'.format(
-                key_filename
-            )
-        )
-
     # Get SSH Gateway config early to verify the private_key,
     # if used, exists or not. We don't want to deploy an instance
     # and not be able to access it via the gateway.
-    ssh_gateway_config = get_ssh_gateway_config(vm_)
-
-    location = get_location(vm_)
-    log.info('Creating Cloud VM {0} in {1}'.format(vm_['name'], location))
-    usernames = ssh_username(vm_)
-
-    # do we launch a regular vm or a spot instance?
-    # see http://goo.gl/hYZ13f for more information on EC2 API
-    spot_config = get_spot_config(vm_)
-    if spot_config is not None:
-        if 'spot_price' not in spot_config:
-            raise SaltCloudSystemExit(
-                'Spot instance config for {0} requires a spot_price '
-                'attribute.'.format(vm_['name'])
-            )
-
-        params = {'Action': 'RequestSpotInstances',
-                  'InstanceCount': '1',
-                  'Type': spot_config['type'] if 'type' in spot_config else 'one-time',
-                  'SpotPrice': spot_config['spot_price']}
-
-        # All of the necessary launch parameters for a VM when using
-        # spot instances are the same except for the prefix below
-        # being tacked on.
-        spot_prefix = 'LaunchSpecification.'
-
-    # regular EC2 instance
-    else:
-        params = {'Action': 'RunInstances',
-                  'MinCount': '1',
-                  'MaxCount': '1'}
-
-        # Normal instances should have no prefix.
-        spot_prefix = ''
-
-    image_id = vm_['image']
-    params[spot_prefix + 'ImageId'] = image_id
-
-    vm_size = config.get_cloud_config_value(
-        'size', vm_, __opts__, search_global=False
-    )
-    if vm_size in SIZE_MAP:
-        vm_size = SIZE_MAP[vm_size]
-    params[spot_prefix + 'InstanceType'] = vm_size
-
-    ex_keyname = keyname(vm_)
-    if ex_keyname:
-        params[spot_prefix + 'KeyName'] = ex_keyname
-
-    ex_securitygroup = securitygroup(vm_)
-    if ex_securitygroup:
-        if not isinstance(ex_securitygroup, list):
-            params[spot_prefix + 'SecurityGroup.1'] = ex_securitygroup
-        else:
-            for counter, sg_ in enumerate(ex_securitygroup):
-                params[spot_prefix + 'SecurityGroup.{0}'.format(counter)] = sg_
-
-    ex_iam_profile = iam_profile(vm_)
-    if ex_iam_profile:
-        try:
-            if ex_iam_profile.startswith('arn:aws:iam:'):
-                params[spot_prefix + 'IamInstanceProfile.Arn'] = ex_iam_profile
-            else:
-                params[spot_prefix + 'IamInstanceProfile.Name'] = ex_iam_profile
-        except AttributeError:
-            raise SaltCloudConfigError(
-                '\'iam_profile\' should be a string value.'
-            )
-
-    az_ = get_availability_zone(vm_)
-    if az_ is not None:
-        params[spot_prefix + 'Placement.AvailabilityZone'] = az_
-
-    tenancy_ = get_tenancy(vm_)
-    if tenancy_ is not None:
-        if spot_config is not None:
-            raise SaltCloudConfigError(
-                'Spot instance config for {0} does not support '
-                'specifying tenancy.'.format(vm_['name'])
-            )
-        params['Placement.Tenancy'] = tenancy_
-
-    subnetid_ = get_subnetid(vm_)
-    if subnetid_ is not None:
-        params[spot_prefix + 'SubnetId'] = subnetid_
-
-    ex_securitygroupid = securitygroupid(vm_)
-    if ex_securitygroupid:
-        if not isinstance(ex_securitygroupid, list):
-            params[spot_prefix + 'SecurityGroupId.1'] = ex_securitygroupid
-        else:
-            for (counter, sg_) in enumerate(ex_securitygroupid):
-                params[spot_prefix + 'SecurityGroupId.{0}'.format(counter)] = sg_
-
-    ex_blockdevicemappings = block_device_mappings(vm_)
-    if ex_blockdevicemappings:
-        params.update(_param_from_config(spot_prefix + 'BlockDeviceMapping', ex_blockdevicemappings))
-
-    network_interfaces = config.get_cloud_config_value(
-        'network_interfaces', vm_, __opts__, search_global=False
-    )
-
-    if network_interfaces:
-        params.update(_param_from_config(spot_prefix + 'NetworkInterface', network_interfaces))
-
-    set_ebs_optimized = config.get_cloud_config_value(
-        'ebs_optimized', vm_, __opts__, search_global=False
-    )
-
-    if set_ebs_optimized is not None:
-        if not isinstance(set_ebs_optimized, bool):
-            raise SaltCloudConfigError(
-                '\'ebs_optimized\' should be a boolean value.'
-            )
-        params[spot_prefix + 'EbsOptimized'] = set_ebs_optimized
-
-    set_del_root_vol_on_destroy = config.get_cloud_config_value(
-        'del_root_vol_on_destroy', vm_, __opts__, search_global=False
-    )
-
-    if set_del_root_vol_on_destroy is not None:
-        if not isinstance(set_del_root_vol_on_destroy, bool):
-            raise SaltCloudConfigError(
-                '\'del_root_vol_on_destroy\' should be a boolean value.'
-            )
-
-    if set_del_root_vol_on_destroy:
-        # first make sure to look up the root device name
-        # as Ubuntu and CentOS (and most likely other OSs)
-        # use different device identifiers
-
-        log.info('Attempting to look up root device name for image id {0} on '
-                 'VM {1}'.format(image_id, vm_['name']))
-
-        rd_params = {
-            'Action': 'DescribeImages',
-            'ImageId.1': image_id
-        }
-        try:
-            rd_data = query(rd_params, location=location)
-            if 'error' in rd_data:
-                return rd_data['error']
-            log.debug('EC2 Response: {0!r}'.format(rd_data))
-        except Exception as exc:
-            log.error(
-                'Error getting root device name for image id {0} for '
-                'VM {1}: \n{2}'.format(image_id, vm_['name'], exc),
-                # Show the traceback if the debug logging level is enabled
-                exc_info=log.isEnabledFor(logging.DEBUG)
-            )
-            raise
-
-        # make sure we have a response
-        if not rd_data:
-            err_msg = 'There was an error querying EC2 for the root device ' \
-                      'of image id {0}. Empty response.'.format(image_id)
-            raise SaltCloudSystemExit(err_msg)
-
-        # pull the root device name from the result and use it when
-        # launching the new VM
-        if rd_data[0]['blockDeviceMapping'] is None:
-            # Some ami instances do not have a root volume. Ignore such cases
-            rd_name = None
-        elif type(rd_data[0]['blockDeviceMapping']['item']) is list:
-            rd_name = rd_data[0]['blockDeviceMapping']['item'][0]['deviceName']
-        else:
-            rd_name = rd_data[0]['blockDeviceMapping']['item']['deviceName']
-        log.info('Found root device name: {0}'.format(rd_name))
-
-        if rd_name is not None:
-            if ex_blockdevicemappings:
-                dev_list = [dev['DeviceName'] for dev in ex_blockdevicemappings]
-            else:
-                dev_list = []
-
-            if rd_name in dev_list:
-                dev_index = dev_list.index(rd_name)
-                termination_key = spot_prefix + 'BlockDeviceMapping.%d.Ebs.DeleteOnTermination' % dev_index
-                params[termination_key] = str(set_del_root_vol_on_destroy).lower()
-            else:
-                dev_index = len(dev_list)
-                params[spot_prefix + 'BlockDeviceMapping.%d.DeviceName' % dev_index] = rd_name
-                params[spot_prefix + 'BlockDeviceMapping.%d.Ebs.DeleteOnTermination' % dev_index] = str(
-                    set_del_root_vol_on_destroy
-                ).lower()
-
-    set_del_all_vols_on_destroy = config.get_cloud_config_value(
-        'del_all_vols_on_destroy', vm_, __opts__, search_global=False
-    )
-
-    if set_del_all_vols_on_destroy is not None:
-        if not isinstance(set_del_all_vols_on_destroy, bool):
-            raise SaltCloudConfigError(
-                '\'del_all_vols_on_destroy\' should be a boolean value.'
-            )
-
-    tags = config.get_cloud_config_value('tag', vm_, __opts__, {}, search_global=False)
-    if not isinstance(tags, dict):
-        raise SaltCloudConfigError(
-                '\'tag\' should be a dict.'
-        )
-
-    for value in tags.values():
-        if not isinstance(value, str):
-            raise SaltCloudConfigError(
-                '\'tag\' values must be strings. Try quoting the values. e.g. "2013-09-19T20:09:46Z".'
-            )
-
-    tags['Name'] = vm_['name']
-
-    salt.utils.cloud.fire_event(
-        'event',
-        'requesting instance',
-        'salt/cloud/{0}/requesting'.format(vm_['name']),
-        {'kwargs': params, 'location': location},
-    )
-
-    try:
-        data = query(params, 'instancesSet', location=location)
-        if 'error' in data:
-            return data['error']
-    except Exception as exc:
-        log.error(
-            'Error creating {0} on EC2 when trying to run the initial '
-            'deployment: \n{1}'.format(
-                vm_['name'], exc
-            ),
-            # Show the traceback if the debug logging level is enabled
-            exc_info=log.isEnabledFor(logging.DEBUG)
-        )
-        raise
-
-    # if we're using spot instances, we need to wait for the spot request
-    # to become active before we continue
-    if spot_config:
-        sir_id = data[0]['spotInstanceRequestId']
-
-        def __query_spot_instance_request(sir_id, location):
-            params = {'Action': 'DescribeSpotInstanceRequests',
-                      'SpotInstanceRequestId.1': sir_id}
-            data = query(params, location=location)
-            if not data:
-                log.error(
-                    'There was an error while querying EC2. Empty response'
-                )
-                # Trigger a failure in the wait for spot instance method
-                return False
-
-            if isinstance(data, dict) and 'error' in data:
-                log.warn(
-                    'There was an error in the query. {0}'.format(data['error'])
-                )
-                # Trigger a failure in the wait for spot instance method
-                return False
-
-            log.debug('Returned query data: {0}'.format(data))
-
-            if 'state' in data[0]:
-                state = data[0]['state']
-
-            if state == 'active':
-                return data
-
-            if state == 'open':
-                # Still waiting for an active state
-                log.info('Spot instance status: {0}'.format(
-                    data[0]['status']['message']
-                ))
-                return None
-
-            if state in ['cancelled', 'failed', 'closed']:
-                # Request will never be active, fail
-                log.error('Spot instance request resulted in state \'{0}\'. '
-                          'Nothing else we can do here.')
-                return False
-
-        salt.utils.cloud.fire_event(
-            'event',
-            'waiting for spot instance',
-            'salt/cloud/{0}/waiting_for_spot'.format(vm_['name']),
-        )
-
-        try:
-            data = _wait_for_spot_instance(
-                __query_spot_instance_request,
-                update_args=(sir_id, location),
-                timeout=config.get_cloud_config_value(
-                    'wait_for_spot_timeout', vm_, __opts__, default=10 * 60),
-                interval=config.get_cloud_config_value(
-                    'wait_for_spot_interval', vm_, __opts__, default=30),
-                interval_multiplier=config.get_cloud_config_value(
-                    'wait_for_spot_interval_multiplier', vm_, __opts__, default=1),
-                max_failures=config.get_cloud_config_value(
-                    'wait_for_spot_max_failures', vm_, __opts__, default=10),
-            )
-            log.debug('wait_for_spot_instance data {0}'.format(data))
-
-        except (SaltCloudExecutionTimeout, SaltCloudExecutionFailure) as exc:
-            try:
-                # Cancel the existing spot instance request
-                params = {'Action': 'CancelSpotInstanceRequests',
-                          'SpotInstanceRequestId.1': sir_id}
-                data = query(params, location=location)
-
-                log.debug('Canceled spot instance request {0}. Data '
-                          'returned: {1}'.format(sir_id, data))
-
-            except SaltCloudSystemExit:
-                pass
-            finally:
-                raise SaltCloudSystemExit(exc.message)
-
-    # Pull the instance ID, valid for both spot and normal instances
-    instance_id = data[0]['instanceId']
-
-    salt.utils.cloud.fire_event(
-        'event',
-        'querying instance',
-        'salt/cloud/{0}/querying'.format(vm_['name']),
-        {'instance_id': instance_id},
-    )
-
-    log.debug('The new VM instance_id is {0}'.format(instance_id))
-
-    params = {'Action': 'DescribeInstances',
-              'InstanceId.1': instance_id}
-
-    attempts = 5
-    while attempts > 0:
-        data, requesturl = query(params, location=location, return_url=True)
-        log.debug('The query returned: {0}'.format(data))
-
-        if isinstance(data, dict) and 'error' in data:
-            log.warn(
-                'There was an error in the query. {0} attempts '
-                'remaining: {1}'.format(
-                    attempts, data['error']
-                )
-            )
-            attempts -= 1
-            continue
-
-        if isinstance(data, list) and not data:
-            log.warn(
-                'Query returned an empty list. {0} attempts '
-                'remaining.'.format(attempts)
-            )
-            attempts -= 1
-            continue
-
-        break
-    else:
-        raise SaltCloudSystemExit(
-            'An error occurred while creating VM: {0}'.format(data['error'])
-        )
-
-    def __query_ip_address(params, url):
-        data = query(params, requesturl=url)
-        if not data:
-            log.error(
-                'There was an error while querying EC2. Empty response'
-            )
-            # Trigger a failure in the wait for IP function
-            return False
-
-        if isinstance(data, dict) and 'error' in data:
-            log.warn(
-                'There was an error in the query. {0}'.format(data['error'])
-            )
-            # Trigger a failure in the wait for IP function
-            return False
-
-        log.debug('Returned query data: {0}'.format(data))
-
-        if 'ipAddress' in data[0]['instancesSet']['item']:
-            return data
-        if ssh_interface(vm_) == 'private_ips' and \
-           'privateIpAddress' in data[0]['instancesSet']['item']:
-            return data
-
-    try:
-        data = salt.utils.cloud.wait_for_ip(
-            __query_ip_address,
-            update_args=(params, requesturl),
-            timeout=config.get_cloud_config_value(
-                'wait_for_ip_timeout', vm_, __opts__, default=10 * 60),
-            interval=config.get_cloud_config_value(
-                'wait_for_ip_interval', vm_, __opts__, default=10),
-            interval_multiplier=config.get_cloud_config_value(
-                'wait_for_ip_interval_multiplier', vm_, __opts__, default=1),
-        )
-    except (SaltCloudExecutionTimeout, SaltCloudExecutionFailure) as exc:
-        try:
-            # It might be already up, let's destroy it!
-            destroy(vm_['name'])
-        except SaltCloudSystemExit:
-            pass
-        finally:
-            raise SaltCloudSystemExit(exc.message)
-
-    salt.utils.cloud.fire_event(
-        'event',
-        'setting tags',
-        'salt/cloud/{0}/tagging'.format(vm_['name']),
-        {'tags': tags},
-    )
-
-    set_tags(
-        vm_['name'], tags,
-        instance_id=instance_id, call='action', location=location
-    )
-    log.info('Created node {0}'.format(vm_['name']))
-
-    if ssh_interface(vm_) == 'private_ips':
-        ip_address = data[0]['instancesSet']['item']['privateIpAddress']
-        log.info('Salt node data. Private_ip: {0}'.format(ip_address))
-    else:
-        ip_address = data[0]['instancesSet']['item']['ipAddress']
-        log.info('Salt node data. Public_ip: {0}'.format(ip_address))
-
-    display_ssh_output = config.get_cloud_config_value(
-        'display_ssh_output', vm_, __opts__, default=True
-    )
-
-    salt.utils.cloud.fire_event(
-        'event',
-        'waiting for ssh',
-        'salt/cloud/{0}/waiting_for_ssh'.format(vm_['name']),
-        {'ip_address': ip_address},
-    )
-
-    ssh_connect_timeout = config.get_cloud_config_value(
-        'ssh_connect_timeout', vm_, __opts__, 900   # 15 minutes
-    )
-
-    if config.get_cloud_config_value('win_installer', vm_, __opts__):
-        username = config.get_cloud_config_value(
-                'win_username', vm_, __opts__, default='Administrator'
-            )
-        win_passwd = config.get_cloud_config_value(
-                'win_password', vm_, __opts__, default=''
-            )
-        if not salt.utils.cloud.wait_for_port(ip_address,
-                                              port=445,
-                                              timeout=ssh_connect_timeout):
-            raise SaltCloudSystemExit(
-                'Failed to connect to remote windows host'
-            )
-        if not salt.utils.cloud.validate_windows_cred(ip_address,
-                                                      username,
-                                                      win_passwd):
-            raise SaltCloudSystemExit(
-                'Failed to authenticate against remote windows host'
-            )
-    elif salt.utils.cloud.wait_for_port(ip_address, timeout=ssh_connect_timeout,
-                                        gateway=ssh_gateway_config):
-        for user in usernames:
-            if salt.utils.cloud.wait_for_passwd(
-                host=ip_address,
-                username=user,
-                ssh_timeout=config.get_cloud_config_value(
-                    'wait_for_passwd_timeout', vm_, __opts__, default=1 * 60),
-                key_filename=key_filename,
-                display_ssh_output=display_ssh_output,
-                gateway=ssh_gateway_config
-            ):
-                username = user
-                break
-        else:
-            raise SaltCloudSystemExit(
-                'Failed to authenticate against remote ssh'
-            )
-    else:
-        raise SaltCloudSystemExit(
-            'Failed to connect to remote ssh'
-        )
-
-    ret = {}
-    if config.get_cloud_config_value('deploy', vm_, __opts__) is True:
-        deploy_script = script(vm_)
-        deploy_kwargs = {
-            'host': ip_address,
-            'username': username,
-            'key_filename': key_filename,
-            'tmp_dir': config.get_cloud_config_value(
-                'tmp_dir', vm_, __opts__, default='/tmp/.saltcloud'
-            ),
-            'deploy_command': config.get_cloud_config_value(
-                'deploy_command', vm_, __opts__,
-                default='/tmp/.saltcloud/deploy.sh',
-            ),
-            'tty': config.get_cloud_config_value(
-                'tty', vm_, __opts__, default=True
-            ),
-            'script': deploy_script,
-            'name': vm_['name'],
-            'sudo': config.get_cloud_config_value(
-                'sudo', vm_, __opts__, default=(username != 'root')
-            ),
-            'sudo_password': config.get_cloud_config_value(
-                'sudo_password', vm_, __opts__, default=None
-            ),
-            'start_action': __opts__['start_action'],
-            'parallel': __opts__['parallel'],
-            'conf_file': __opts__['conf_file'],
-            'sock_dir': __opts__['sock_dir'],
-            'minion_pem': vm_['priv_key'],
-            'minion_pub': vm_['pub_key'],
-            'keep_tmp': __opts__['keep_tmp'],
-            'preseed_minion_keys': vm_.get('preseed_minion_keys', None),
-            'display_ssh_output': display_ssh_output,
-            'minion_conf': salt.utils.cloud.minion_config(__opts__, vm_),
-            'script_args': config.get_cloud_config_value(
-                'script_args', vm_, __opts__
-            ),
-            'script_env': config.get_cloud_config_value(
-                'script_env', vm_, __opts__
-            )
-        }
-
-        # Deploy salt-master files, if necessary
-        if config.get_cloud_config_value('make_master', vm_, __opts__) is True:
-            deploy_kwargs['make_master'] = True
-            deploy_kwargs['master_pub'] = vm_['master_pub']
-            deploy_kwargs['master_pem'] = vm_['master_pem']
-            master_conf = salt.utils.cloud.master_config(__opts__, vm_)
-            deploy_kwargs['master_conf'] = master_conf
-
-            if master_conf.get('syndic_master', None):
-                deploy_kwargs['make_syndic'] = True
-
-        deploy_kwargs['make_minion'] = config.get_cloud_config_value(
-            'make_minion', vm_, __opts__, default=True
-        )
-
-        # Check for Windows install params
-        win_installer = config.get_cloud_config_value('win_installer',
-                                                      vm_,
-                                                      __opts__)
-        if win_installer:
-            deploy_kwargs['win_installer'] = win_installer
-            minion = salt.utils.cloud.minion_config(__opts__, vm_)
-            deploy_kwargs['master'] = minion['master']
-            deploy_kwargs['username'] = config.get_cloud_config_value(
-                'win_username', vm_, __opts__, default='Administrator'
-            )
-            deploy_kwargs['password'] = config.get_cloud_config_value(
-                'win_password', vm_, __opts__, default=''
-            )
-
-        # Copy ssh_gateway_config into deploy scripts
-        if ssh_gateway_config:
-            deploy_kwargs['gateway'] = ssh_gateway_config
-
-        # Store what was used to the deploy the VM
-        event_kwargs = copy.deepcopy(deploy_kwargs)
-        del event_kwargs['minion_pem']
-        del event_kwargs['minion_pub']
-        del event_kwargs['sudo_password']
-        if 'password' in event_kwargs:
-            del event_kwargs['password']
-        if 'gateway' in event_kwargs:
-            if 'ssh_gateway_password' in event_kwargs['gateway']:
-                del event_kwargs['gateway']['ssh_gateway_password']
-        ret['deploy_kwargs'] = event_kwargs
-
-        salt.utils.cloud.fire_event(
-            'event',
-            'executing deploy script',
-            'salt/cloud/{0}/deploying'.format(vm_['name']),
-            {'kwargs': event_kwargs},
-        )
-
-        deployed = False
-        if win_installer:
-            deployed = salt.utils.cloud.deploy_windows(**deploy_kwargs)
-        else:
-            deployed = salt.utils.cloud.deploy_script(**deploy_kwargs)
-
-        if deployed:
-            log.info('Salt installed on {name}'.format(**vm_))
-        else:
-            log.error('Failed to start Salt on Cloud VM {name}'.format(**vm_))
+    ssh_gateway_config = get_ssh_gateway_config(vm_)  # NOQA
+
+    # Same check for regular SSH key
+    key_filename = get_key_filename(vm_)  # NOQA
+
+    # Launch the vm
+    instance_data, volumes = launch_instance(vm_)
+
+    # Update the return dict with the instance data and
+    # volume data if it exists
+    ret.update(instance_data)
+    if volumes:
+        ret['Attached Volumes'] = volumes
 
     log.info('Created Cloud VM {0[name]!r}'.format(vm_))
     log.debug(
         '{0[name]!r} VM creation details:\n{1}'.format(
-            vm_, pprint.pformat(data[0]['instancesSet']['item'])
+            vm_, pprint.pformat(instance_data)
         )
     )
-
-    ret.update(data[0]['instancesSet']['item'])
-
-    # Get ANY defined volumes settings, merging data, in the following order
-    # 1. VM config
-    # 2. Profile config
-    # 3. Global configuration
-    volumes = config.get_cloud_config_value(
-        'volumes', vm_, __opts__, search_global=True
-    )
-    if volumes:
-        salt.utils.cloud.fire_event(
-            'event',
-            'attaching volumes',
-            'salt/cloud/{0}/attaching_volumes'.format(vm_['name']),
-            {'volumes': volumes},
-        )
-
-        log.info('Create and attach volumes to node {0}'.format(vm_['name']))
-        created = create_attach_volumes(
-            vm_['name'],
-            {
-                'volumes': volumes,
-                'zone': ret['placement']['availabilityZone'],
-                'instance_id': ret['instanceId'],
-                'del_all_vols_on_destroy': set_del_all_vols_on_destroy
-            },
-            call='action'
-        )
-        ret['Attached Volumes'] = created
 
     salt.utils.cloud.fire_event(
         'event',
@@ -1587,9 +1584,12 @@ def create(vm_=None, call=None):
             'name': vm_['name'],
             'profile': vm_['profile'],
             'provider': vm_['provider'],
-            'instance_id': instance_id,
+            'instance_id': instance_data['instanceId'],
         },
     )
+
+    # saltify
+    deploy(vm_, call='action')
 
     return ret
 
@@ -1642,7 +1642,8 @@ def create_attach_volumes(name, kwargs, call=None):
 
         attach = attach_volume(
             name,
-            {'volume_id': volume_dict['volume_id'], 'device': volume['device']},
+            {'volume_id': volume_dict['volume_id'],
+             'device': volume['device']},
             instance_id=kwargs['instance_id'],
             call='action'
         )
@@ -1717,6 +1718,14 @@ def set_tags(name, tags, call=None, location=None, instance_id=None):
 
         salt-cloud -a set_tags mymachine tag1=somestuff tag2='Other stuff'
     '''
+
+    salt.utils.cloud.fire_event(
+        'event',
+        'setting tags',
+        'salt/cloud/{0}/tagging'.format(name),
+        {'tags': tags},
+    )
+
     if call != 'action':
         raise SaltCloudSystemExit(
             'The set_tags action must be called with -a or --action.'
@@ -1889,8 +1898,9 @@ def destroy(name, call=None):
     ret = {}
 
     if config.get_cloud_config_value('rename_on_destroy',
-                               get_configured_provider(),
-                               __opts__, search_global=False) is True:
+                                     get_configured_provider(),
+                                     __opts__,
+                                     search_global=False) is True:
         newname = '{0}-DEL{1}'.format(name, uuid.uuid4().hex)
         rename(name, kwargs={'newname': newname}, call='action')
         log.info(
@@ -1999,7 +2009,8 @@ def list_nodes_full(location=None, call=None):
     '''
     if call == 'action':
         raise SaltCloudSystemExit(
-            'The list_nodes_full function must be called with -f or --function.'
+            'The list_nodes_full function must be called with -f or '
+            '--function.'
         )
 
     if not location:
@@ -2570,3 +2581,131 @@ def delete_keypair(kwargs=None, call=None):
 
     data = query(params, return_root=True)
     return data
+
+
+def deploy(vm_=None, call=None):
+    if call != 'action':
+        raise SaltCloudSystemExit(
+            'The deploy action must be called with -a or --action.'
+        )
+
+    location = get_location()
+    node = _get_node(vm_, location)
+    if get_ssh_interface(node) == 'private_ips':
+        ip_address = node['privateIpAddress']
+    else:
+        ip_address = node['ipAddress']
+
+    log.info(node)
+    log.info(ip_address)
+
+    1 / 0
+
+    ret = {}
+    if config.get_cloud_config_value('deploy', vm_, __opts__) is True:
+        deploy_script = script(vm_)
+        deploy_kwargs = {
+            'host': ip_address,
+            'username': username,
+            'key_filename': key_filename,
+            'tmp_dir': config.get_cloud_config_value(
+                'tmp_dir', vm_, __opts__, default='/tmp/.saltcloud'
+            ),
+            'deploy_command': config.get_cloud_config_value(
+                'deploy_command', vm_, __opts__,
+                default='/tmp/.saltcloud/deploy.sh',
+            ),
+            'tty': config.get_cloud_config_value(
+                'tty', vm_, __opts__, default=True
+            ),
+            'script': deploy_script,
+            'name': vm_['name'],
+            'sudo': config.get_cloud_config_value(
+                'sudo', vm_, __opts__, default=(username != 'root')
+            ),
+            'sudo_password': config.get_cloud_config_value(
+                'sudo_password', vm_, __opts__, default=None
+            ),
+            'start_action': __opts__['start_action'],
+            'parallel': __opts__['parallel'],
+            'conf_file': __opts__['conf_file'],
+            'sock_dir': __opts__['sock_dir'],
+            'minion_pem': vm_['priv_key'],
+            'minion_pub': vm_['pub_key'],
+            'keep_tmp': __opts__['keep_tmp'],
+            'preseed_minion_keys': vm_.get('preseed_minion_keys', None),
+            'display_ssh_output': display_ssh_output,
+            'minion_conf': salt.utils.cloud.minion_config(__opts__, vm_),
+            'script_args': config.get_cloud_config_value(
+                'script_args', vm_, __opts__
+            ),
+            'script_env': config.get_cloud_config_value(
+                'script_env', vm_, __opts__
+            )
+        }
+
+        # Deploy salt-master files, if necessary
+        if config.get_cloud_config_value('make_master', vm_, __opts__) is True:
+            deploy_kwargs['make_master'] = True
+            deploy_kwargs['master_pub'] = vm_['master_pub']
+            deploy_kwargs['master_pem'] = vm_['master_pem']
+            master_conf = salt.utils.cloud.master_config(__opts__, vm_)
+            deploy_kwargs['master_conf'] = master_conf
+
+            if master_conf.get('syndic_master', None):
+                deploy_kwargs['make_syndic'] = True
+
+        deploy_kwargs['make_minion'] = config.get_cloud_config_value(
+            'make_minion', vm_, __opts__, default=True
+        )
+
+        # Check for Windows install params
+        win_installer = config.get_cloud_config_value('win_installer',
+                                                      vm_,
+                                                      __opts__)
+        if win_installer:
+            deploy_kwargs['win_installer'] = win_installer
+            minion = salt.utils.cloud.minion_config(__opts__, vm_)
+            deploy_kwargs['master'] = minion['master']
+            deploy_kwargs['username'] = config.get_cloud_config_value(
+                'win_username', vm_, __opts__, default='Administrator'
+            )
+            deploy_kwargs['password'] = config.get_cloud_config_value(
+                'win_password', vm_, __opts__, default=''
+            )
+
+        # Copy ssh_gateway_config into deploy scripts
+        if ssh_gateway_config:
+            deploy_kwargs['gateway'] = ssh_gateway_config
+
+        # Store what was used to the deploy the VM
+        event_kwargs = copy.deepcopy(deploy_kwargs)
+        del event_kwargs['minion_pem']
+        del event_kwargs['minion_pub']
+        del event_kwargs['sudo_password']
+        if 'password' in event_kwargs:
+            del event_kwargs['password']
+        if 'gateway' in event_kwargs:
+            if 'ssh_gateway_password' in event_kwargs['gateway']:
+                del event_kwargs['gateway']['ssh_gateway_password']
+        ret['deploy_kwargs'] = event_kwargs
+
+        salt.utils.cloud.fire_event(
+            'event',
+            'executing deploy script',
+            'salt/cloud/{0}/deploying'.format(vm_['name']),
+            {'kwargs': event_kwargs},
+        )
+
+        deployed = False
+        if win_installer:
+            deployed = salt.utils.cloud.deploy_windows(**deploy_kwargs)
+        else:
+            deployed = salt.utils.cloud.deploy_script(**deploy_kwargs)
+
+        if deployed:
+            log.info('Salt installed on {name}'.format(**vm_))
+        else:
+            log.error('Failed to start Salt on Cloud VM {name}'.format(**vm_))
+
+    return ret
