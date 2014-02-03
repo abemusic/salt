@@ -1371,16 +1371,30 @@ class State(object):
                 self.verify_ret(ret)
         except Exception:
             trb = traceback.format_exc()
+            # There are a number of possibilities to not have the cdata
+            # populated with what we might have expected, so just be enought
+            # smart to not raise another KeyError as the name is easily
+            # guessable and fallback in all cases to present the real
+            # exception to the user
+            if len(cdata['args']) > 0:
+                name = cdata['args'][0]
+            elif 'name' in cdata['kwargs']:
+                name = cdata['kwargs'].get(
+                    'name',
+                    low.get('name',
+                            low.get('__id__'))
+                )
             ret = {
                 'result': False,
-                'name': cdata['args'][0],
+                'name': name,
                 'changes': {},
                 'comment': 'An exception occurred in this state: {0}'.format(
                     trb)
-                }
+            }
         finally:
             if low.get('__prereq__'):
-                sys.modules[self.states[cdata['full']].__module__].__opts__['test'] = test
+                sys.modules[self.states[cdata['full']].__module__].__opts__[
+                    'test'] = test
 
         # If format_call got any warnings, let's show them to the user
         if 'warnings' in cdata:
@@ -2030,18 +2044,24 @@ class BaseHighState(object):
                 if saltenv != self.opts['environment']:
                     continue
             for match, data in body.items():
-                if isinstance(data, string_types):
-                    data = [data]
-                if self.matcher.confirm_top(
-                        match,
-                        data,
-                        self.opts['nodegroups']
-                        ):
-                    if saltenv not in matches:
-                        matches[saltenv] = []
-                    for item in data:
-                        if isinstance(item, string_types):
-                            matches[saltenv].append(item)
+                def _filter_matches(_match, _data, _opts):
+                    if isinstance(_data, string_types):
+                        _data = [_data]
+                    if self.matcher.confirm_top(
+                            _match,
+                            _data,
+                            _opts
+                            ):
+                        if saltenv not in matches:
+                            matches[saltenv] = []
+                        for item in _data:
+                            if 'subfilter' in item:
+                                _tmpdata = item.pop('subfilter')
+                                for match, data in _tmpdata.items():
+                                    _filter_matches(match, data, _opts)
+                            if isinstance(item, string_types):
+                                matches[saltenv].append(item)
+                _filter_matches(match, data, self.opts['nodegroups'])
         ext_matches = self.client.ext_nodes()
         for saltenv in ext_matches:
             if saltenv in matches:

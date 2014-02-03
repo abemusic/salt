@@ -155,6 +155,8 @@ class FileBlockReplaceTestCase(TestCase):
                                                  prefix='blockrepltmp')
         self.tfile.write(self.MULTILINE_STRING)
         self.tfile.close()
+        manage_mode_mock = MagicMock()
+        filemod.__salt__['config.manage_mode'] = manage_mode_mock
 
     def tearDown(self):
         os.remove(self.tfile.name)
@@ -380,6 +382,37 @@ class FileModuleTestCase(TestCase):
             filemod.append(tfile.name, 'bar')
             with open(tfile.name) as tfile2:
                 self.assertEqual(tfile2.read(), 'bar\n')
+
+    def test_extract_hash(self):
+        '''
+        Check various hash file formats.
+        '''
+        # With file name
+        with tempfile.NamedTemporaryFile() as tfile:
+            tfile.write('rc.conf ef6e82e4006dee563d98ada2a2a80a27\n')
+            tfile.write(
+                'ead48423703509d37c4a90e6a0d53e143b6fc268 example.tar.gz\n')
+            tfile.flush()
+            result = filemod.extract_hash(tfile.name, '', '/rc.conf')
+            self.assertEqual(result, {
+                'hsum': 'ef6e82e4006dee563d98ada2a2a80a27',
+                'hash_type': 'md5'
+            })
+
+            result = filemod.extract_hash(tfile.name, '', '/example.tar.gz')
+            self.assertEqual(result, {
+                'hsum': 'ead48423703509d37c4a90e6a0d53e143b6fc268',
+                'hash_type': 'sha1'
+            })
+        # Solohash - no file name (Maven repo checksum file format)
+        with tempfile.NamedTemporaryFile() as tfile:
+            tfile.write('ead48423703509d37c4a90e6a0d53e143b6fc268\n')
+            tfile.flush()
+            result = filemod.extract_hash(tfile.name, '', '/testfile')
+            self.assertEqual(result, {
+                'hsum': 'ead48423703509d37c4a90e6a0d53e143b6fc268',
+                'hash_type': 'sha1'
+            })
 
 
 if __name__ == '__main__':
